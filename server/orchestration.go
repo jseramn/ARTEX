@@ -272,6 +272,7 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			"goal":                   strParam("task goal (what to achieve)"),
 			"parent_ref":             strParam("optional: parent task id (for parent-child linking)"),
 			"source_task_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": fmt.Sprintf("optional: ids of source tasks to inherit read-only (at most %d). The subtask may read the assets/conclusions those tasks already explored as its starting point; unlike parent_ref's plain parent-child pointer, this is content inheritance.", db.MaxTaskSourceCount)},
+			"company_ids":            map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": fmt.Sprintf("optional: ids of companies whose asset scopes attach to the task (at most %d; see list_companies). The task inherits each company's attributed assets as scope context and becomes visible under those companies in the UI — pass them whenever the target belongs to a known company, otherwise the task shows in no company-filtered view.", db.MaxTaskCompanyCount)},
 			"llm_profile_id":         map[string]any{"type": "integer", "description": "optional: the LLM profile id this subtask's planner/worker uses (see list_llm_profiles); empty inherits the parent task, then falls back to the global active profile"},
 			"timeout_seconds":        map[string]any{"type": "integer", "description": "optional: task-level timeout (seconds). When it fires, a graceful wrap-up runs and the task enters the timeout terminal state; empty or 0 = no time limit"},
 			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "optional: planner heartbeat interval (seconds). When this much time has passed since the last planning round ended/the task started with no trigger in between → run one planning round (deadlock backstop + wakes the planner to supervise in-flight workers). Empty or 0 = default 600 (10min);"},
@@ -279,14 +280,15 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 		}, "description", "goal"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
-				Description          string          `json:"description"`
-				Goal                 string          `json:"goal"`
-				ParentRef            string          `json:"parent_ref"`
-				SourceTaskIDs        []string        `json:"source_task_ids"`
-				LLMProfileID         json.RawMessage `json:"llm_profile_id"`
-				TimeoutSeconds       int             `json:"timeout_seconds"`
-				PlanHeartbeatSeconds int             `json:"plan_heartbeat_seconds"`
-				SeedFirstIntent      bool            `json:"seed_first_intent"`
+				Description          string            `json:"description"`
+				Goal                 string            `json:"goal"`
+				ParentRef            string            `json:"parent_ref"`
+				SourceTaskIDs        []string          `json:"source_task_ids"`
+				CompanyIDs           []json.RawMessage `json:"company_ids"`
+				LLMProfileID         json.RawMessage   `json:"llm_profile_id"`
+				TimeoutSeconds       int               `json:"timeout_seconds"`
+				PlanHeartbeatSeconds int               `json:"plan_heartbeat_seconds"`
+				SeedFirstIntent      bool              `json:"seed_first_intent"`
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Description) == "" {
@@ -314,6 +316,18 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				}
 				seenSources[id] = true
 				sourceIDs = append(sourceIDs, id)
+			}
+			companyIDs := make([]int64, 0, len(a.CompanyIDs))
+			for _, raw := range a.CompanyIDs {
+				id := parseProfileID(raw) // reuses the "number or numeric string" parser
+				if id <= 0 {
+					return actool.Errorf("invalid company id in company_ids (positive integers expected; see list_companies)"), nil
+				}
+				companyIDs = append(companyIDs, id)
+			}
+			companyIDs, err := db.NormalizeTaskCompanyIDs(companyIDs)
+			if err != nil {
+				return actool.Errorf(fmt.Sprintf("invalid linked companies: at most %d valid companies may be selected", db.MaxTaskCompanyCount)), nil
 			}
 			// LLM profile resolution: explicit id > inherit parent's pin > active(nil).
 			var pin *int64
@@ -352,6 +366,7 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
 				SourceTaskIDs:        sourceIDs,
+				CompanyIDs:           companyIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
@@ -359,6 +374,9 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 				TargetGate:           gate,
 			})
 			if err != nil {
+				if errors.Is(err, db.ErrTaskCompanyIDsInvalid) || errors.Is(err, db.ErrTaskCompanyNotFound) {
+					return actool.Errorf("linked company not found or invalid (see list_companies)"), nil
+				}
 				return actool.Errorf(err.Error()), nil
 			}
 			if a.ParentRef != "" {
